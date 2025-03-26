@@ -98,6 +98,7 @@ static int callback_chat(struct lws *wsi, enum lws_callback_reasons reason,
                     break;
                 }
             }
+
         } else if (strcmp(type, "broadcast") == 0 ) {
             const char *content = json_string_value(json_object_get(root, "content"));
             char timestamp[64];
@@ -130,6 +131,7 @@ static int callback_chat(struct lws *wsi, enum lws_callback_reasons reason,
           printf("Broadcast enviado por %s: %s\n", sender, content);
             
         } else if (strcmp(type, "private")==0) {
+
           const char *target = json_string_value(json_object_get(root, "target"));
             const char *content = json_string_value(json_object_get(root, "content"));
 
@@ -166,6 +168,7 @@ static int callback_chat(struct lws *wsi, enum lws_callback_reasons reason,
             if (!encontrado) {
                 printf("Usuario destino '%s' no encontrado o no conectado\n", target);
             }
+
         } else if (strcmp(type, "list_users") == 0) {
             char timestamp[64];
             gen_timestamp(timestamp, sizeof(timestamp));
@@ -199,10 +202,165 @@ static int callback_chat(struct lws *wsi, enum lws_callback_reasons reason,
 
             free(response_str);
             json_decref(response);
-        }
 
-          json_decref(root);
-          break;
+        } else if (strcmp(type, "user_info") == 0) {
+            const char *target = json_string_value(json_object_get(root, "target"));
+
+            if (!target) {
+                printf("Mensaje 'user_info' inválido: falta 'target'\n");
+                break;
+            }
+
+            int encontrado = 0;
+
+            for (int i = 0; i < MAX_USERS; i++) {
+                if (users[i].active && strcmp(users[i].username, target) == 0) {
+                    char timestamp[64];
+                    gen_timestamp(timestamp, sizeof(timestamp));
+
+                    // Construir contenido del mensaje
+                    json_t *info = json_object();
+                    json_object_set_new(info, "ip", json_string(users[i].ip));
+                    json_object_set_new(info, "status", json_string(users[i].status));
+
+                    json_t *response = json_object();
+                    json_object_set_new(response, "type", json_string("user_info_response"));
+                    json_object_set_new(response, "sender", json_string("server"));
+                    json_object_set_new(response, "target", json_string(target));
+                    json_object_set_new(response, "content", info);
+                    json_object_set_new(response, "timestamp", json_string(timestamp));
+
+                    // Serializar a string
+                    char *response_str = json_dumps(response, JSON_COMPACT);
+
+                    unsigned char buf[LWS_PRE + 1024];
+                    unsigned char *p = &buf[LWS_PRE];
+                    size_t n = strlen(response_str);
+                    memcpy(p, response_str, n);
+                    lws_write(wsi, p, n, LWS_WRITE_TEXT);
+
+                    printf("Info enviada sobre %s\n", target);
+
+                    free(response_str);
+                    json_decref(response);
+
+                    encontrado = 1;
+                    break;
+                }
+            }
+
+            if (!encontrado) {
+                printf("Usuario '%s' no encontrado\n", target);
+                // O puedes enviar mensaje de error aquí si deseas
+            }
+
+        } else if (strcmp(type, "change_status") == 0) {
+                const char *new_status = json_string_value(json_object_get(root, "content"));
+
+                if (!new_status) {
+                    printf("Mensaje 'change_status' inválido: falta 'content'\n");
+                    break;
+                }
+
+                int actualizado = 0;
+
+                for (int i = 0; i < MAX_USERS; i++) {
+                    if (users[i].active && strcmp(users[i].username, sender) == 0) {
+                        strcpy(users[i].status, new_status);
+                        actualizado = 1;
+
+                        char timestamp[64];
+                        gen_timestamp(timestamp, sizeof(timestamp));
+
+                        // Contenido del mensaje
+                        json_t *status_obj = json_object();
+                        json_object_set_new(status_obj, "user", json_string(sender));
+                        json_object_set_new(status_obj, "status", json_string(new_status));
+
+                        // Mensaje completo
+                        json_t *response = json_object();
+                        json_object_set_new(response, "type", json_string("status_update"));
+                        json_object_set_new(response, "sender", json_string("server"));
+                        json_object_set_new(response, "content", status_obj);
+                        json_object_set_new(response, "timestamp", json_string(timestamp));
+
+                        char *response_str = json_dumps(response, JSON_COMPACT);
+
+                        // Enviar a todos los usuarios conectados
+                        for (int j = 0; j < MAX_USERS; j++) {
+                            if (users[j].active && users[j].wsi) {
+                                unsigned char buf[LWS_PRE + 1024];
+                                unsigned char *p = &buf[LWS_PRE];
+                                size_t n = strlen(response_str);
+                                memcpy(p, response_str, n);
+                                lws_write(users[j].wsi, p, n, LWS_WRITE_TEXT);
+                            }
+                        }
+
+                        printf("Estado de %s cambiado a %s\n", sender, new_status);
+
+                        free(response_str);
+                        json_decref(response);
+                        break;
+                    }
+                }
+
+                if (!actualizado) {
+                    printf("Usuario %s no encontrado para actualizar estado\n", sender);
+                    // Puedes enviar mensaje de error si lo deseas aquí también
+                }
+            } else if (strcmp(type, "disconnect") == 0) {
+                int encontrado = 0;
+
+                for (int i = 0; i< MAX_USERS; i++) {
+                    if (users[i].active && strcmp(users[i].username, sender) == 0 ){
+                        users[i].active = 0;
+                        users[i].wsi = NULL;
+
+                        char timestamp[64];
+                        gen_timestamp(timestamp, sizeof(timestamp));
+
+                        char message[256];
+                        snprintf(message, sizeof(message), "%s ha salido", sender);
+
+                        // Armar respuesta
+                        json_t *response = json_object();
+                        json_object_set_new(response, "type", json_string("user_disconnected"));
+                        json_object_set_new(response, "sender", json_string("server"));
+                        json_object_set_new(response, "content", json_string(message));
+                        json_object_set_new(response, "timestamp", json_string(timestamp));
+
+                        char *response_str = json_dumps(response, JSON_COMPACT);
+
+                        // Enviar a todos los usuarios conectados
+                        for (int j = 0; j < MAX_USERS; j++) {
+                            if (users[j].active && users[j].wsi) {
+                                unsigned char buf[LWS_PRE + 512];
+                                unsigned char *p = &buf[LWS_PRE];
+                                size_t n = strlen(response_str);
+                                memcpy(p, response_str, n);
+                                lws_write(users[j].wsi, p, n, LWS_WRITE_TEXT);
+                            }
+                        }
+
+                        printf("Usuario %s se desconectó voluntariamente\n", sender);
+
+                        free(response_str);
+                        json_decref(response);
+                        encontrado = 1;
+                        break;
+                    }
+                }
+
+                if (!encontrado) {
+                    printf("Usuario %s no encontrado para desconexión\n", sender);
+                }
+
+                lws_close_reason(wsi, LWS_CLOSE_STATUS_NORMAL, (unsigned char *)"Bye", 3);
+                return -1;
+            }
+        json_decref(root);
+        break;
     }
 
     case LWS_CALLBACK_CLOSED: {
