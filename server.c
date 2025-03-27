@@ -1,5 +1,6 @@
 //gcc server.c -o server -lwebsockets -ljansson
 //wscat -c ws://localhost:8000
+//ssh -i /home/czar/ProyectoSistos1/KEY_PAIR_CHAT_SERVER.pem ubuntu@3.144.12.94
 
 #include <libwebsockets.h>
 #include <string.h>
