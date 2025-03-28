@@ -1,4 +1,4 @@
-//gcc client.c -o client -lwebsockets -ljansson
+// gcc client.c -o client -lwebsockets -ljansson
 // npx wscat -c ws://localhost:8000
 
 #include <libwebsockets.h>
@@ -6,13 +6,62 @@
 #include <string.h>
 #include <stdlib.h>
 #include <jansson.h>
+#include <termios.h>
+#include <unistd.h>
+#include <pthread.h>
 
 #define MAX_MESSAGE_LEN 512
 #define MAX_NAME_LEN 50
+#define MAX_BROADCAST_MESSAGES 10
+
+char broadcast_messages[MAX_BROADCAST_MESSAGES][MAX_MESSAGE_LEN];
+int broadcast_count = 0;
+int in_broadcast_mode = 0;
 
 static struct lws *global_wsi;
 static char username[MAX_NAME_LEN];
 static int awaiting_response = 0;
+int is_writing = 0;
+pthread_mutex_t writing_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+// Función para leer un carácter sin esperar Enter
+char getch() {
+    struct termios oldt, newt;
+    char ch;
+    tcgetattr(STDIN_FILENO, &oldt); // Obtener atributos actuales del terminal
+    newt = oldt;
+    newt.c_lflag &= ~(ICANON | ECHO); // Desactivar modo canónico y eco
+    tcsetattr(STDIN_FILENO, TCSANOW, &newt); // Aplicar cambios
+
+    ch = getchar(); // Leer un solo carácter
+
+    tcsetattr(STDIN_FILENO, TCSANOW, &oldt); // Restaurar configuración original
+    return ch;
+}
+
+void redraw_broadcast_screen() {
+    system("clear");
+
+    // Imprimir los últimos mensajes de broadcast
+    for (int i = 0; i < broadcast_count; i++) {
+        printf("%s\n", broadcast_messages[i]);
+    }
+    printf("\nModo broadcast activado. Presiona ESC para volver al menú.\n");
+}
+
+// Función para manejar la recepción de mensajes
+void *receive_messages(void *arg) {
+    struct lws_context *context = (struct lws_context *)arg;
+    while (1) {
+        pthread_mutex_lock(&writing_mutex);
+        if (!is_writing) {
+            lws_service(context, 0);
+        }
+        pthread_mutex_unlock(&writing_mutex);
+        usleep(100000); // Pequeño delay para evitar consumir mucho CPU
+    }
+    return NULL;
+}
 
 static int callback_client(struct lws *wsi, enum lws_callback_reasons reason,
                            void *user, void *in, size_t len) {
@@ -34,91 +83,120 @@ static int callback_client(struct lws *wsi, enum lws_callback_reasons reason,
             lws_callback_on_writable(wsi);
             break;
 
-        case LWS_CALLBACK_CLIENT_WRITEABLE:
-            if (awaiting_response) {
-                break;
-            }
-
-            char mensaje_usuario[MAX_MESSAGE_LEN];
-            printf("Escribir mensaje: ");
-            if (fgets(mensaje_usuario, sizeof(mensaje_usuario), stdin)) {
-                mensaje_usuario[strcspn(mensaje_usuario, "\n")] = 0; // Elimina el salto de línea
-
-                // Crear JSON {"mensaje": "texto"}
-                char json_mensaje[MAX_MESSAGE_LEN];
-                snprintf(json_mensaje, sizeof(json_mensaje), 
-                    "{\"type\": \"message\", \"sender\": \"%s\", \"mensaje\": \"%s\"}",
-                    username, mensaje_usuario);
-
-                size_t mensaje_len = strlen(json_mensaje);
-                unsigned char buffer[LWS_PRE + MAX_MESSAGE_LEN];
-                memcpy(&buffer[LWS_PRE], json_mensaje, mensaje_len);
-
-                // Enviar JSON
-                lws_write(wsi, &buffer[LWS_PRE], mensaje_len, LWS_WRITE_TEXT);
-            }
-            lws_callback_on_writable(wsi);
-            break;
-
         case LWS_CALLBACK_CLIENT_RECEIVE:
-            if (!awaiting_response) {
-                break;
-            }
-
             char mensaje_local[MAX_MESSAGE_LEN];
             memcpy(mensaje_local, in, len);
             mensaje_local[len] = '\0'; // Asegurar que sea una cadena válida
-            
+
             // Parsear JSON
             json_t *root;
             json_error_t error;
             root = json_loads(mensaje_local, 0, &error);
-    
+
             if (!root) {
                 printf("Error al parsear JSON: %s\n", error.text);
                 return 1;
             }
     
             const char *type = json_string_value(json_object_get(root, "type"));
-    
-            if (type && strcmp(type, "list_users_response") == 0) {
-                printf("\nUsuarios conectados:\n");
-                json_t *user_list = json_object_get(root, "content");
-    
-                if (json_is_array(user_list)) {
-                    size_t index;
-                    json_t *value;
-                    json_array_foreach(user_list, index, value) {
-                        const char *usuario = json_string_value(value);
-                        if (usuario){
-                            printf("- %s\n", json_string_value(value));
+        
+            if (!awaiting_response) {
+
+                if (type && strcmp(type, "broadcast") == 0) {
+                    const char *sender = json_string_value(json_object_get(root, "sender"));
+                    const char *content = json_string_value(json_object_get(root, "content"));
+            
+                    if (sender && content) {
+                        // Guardar mensaje en un buffer global para mostrarlo luego
+                        char formatted_message[MAX_MESSAGE_LEN];
+                        snprintf(formatted_message, sizeof(formatted_message), "%s: %s", sender, content);
+            
+                        // Agregar el mensaje al historial de mensajes
+                        if (broadcast_count < MAX_BROADCAST_MESSAGES) {
+                            strcpy(broadcast_messages[broadcast_count], formatted_message);
+                            broadcast_count++;
+                        } else {
+                            // Desplazar mensajes antiguos para hacer espacio
+                            for (int i = 1; i < MAX_BROADCAST_MESSAGES; i++) {
+                                strcpy(broadcast_messages[i - 1], broadcast_messages[i]);
+                            }
+                            strcpy(broadcast_messages[MAX_BROADCAST_MESSAGES - 1], formatted_message);
+                        }
+            
+                        // Volver a dibujar la pantalla en modo broadcast
+                        if (in_broadcast_mode) {
+                            redraw_broadcast_screen();
                         }
                     }
                 }
-                awaiting_response = 0;
-            }
-            else if (type && strcmp(type, "user_info_response") == 0) {
-                // Respuesta de la información de un usuario específico
-                const char *target = json_string_value(json_object_get(root, "target"));
-                json_t *content = json_object_get(root, "content");
+            } else {
+
+                if (type && strcmp(type, "list_users_response") == 0) {
+                    printf("\nUsuarios conectados:\n");
+                    json_t *user_list = json_object_get(root, "content");
+        
+                    if (json_is_array(user_list)) {
+                        size_t index;
+                        json_t *value;
+                        json_array_foreach(user_list, index, value) {
+                            const char *usuario = json_string_value(value);
+                            if (usuario){
+                                printf("- %s\n", json_string_value(value));
+                            }
+                        }
+                    }
+                    awaiting_response = 0;
+                }
+                else if (type && strcmp(type, "user_info_response") == 0) {
+                    // Respuesta de la información de un usuario específico
+                    const char *target = json_string_value(json_object_get(root, "target"));
+                    json_t *content = json_object_get(root, "content");
+                    
+                    if (content && json_is_object(content)) {
+                        const char *ip = json_string_value(json_object_get(content, "ip"));
+                        const char *status = json_string_value(json_object_get(content, "status"));
                 
-                if (content && json_is_object(content)) {
-                    const char *ip = json_string_value(json_object_get(content, "ip"));
-                    const char *status = json_string_value(json_object_get(content, "status"));
+                        printf("\nInformación del usuario %s:\n", target);
+                        printf("IP: %s\n", ip ? ip : "No disponible");
+                        printf("Estado: %s\n", status ? status : "No disponible");
+                    }
+                    else {
+                        printf("Error: No se encontró información para el usuario %s\n", target);
+                    }
+                    awaiting_response = 0;
+                }
+                else if (type && strcmp(type, "broadcast") == 0) {
+                    const char *sender = json_string_value(json_object_get(root, "sender"));
+                    const char *content = json_string_value(json_object_get(root, "content"));
             
-                    printf("\nInformación del usuario %s:\n", target);
-                    printf("IP: %s\n", ip ? ip : "No disponible");
-                    printf("Estado: %s\n", status ? status : "No disponible");
+                    if (sender && content) {
+                        // Guardar mensaje en un buffer global para mostrarlo luego
+                        char formatted_message[MAX_MESSAGE_LEN];
+                        snprintf(formatted_message, sizeof(formatted_message), "%s: %s", sender, content);
+            
+                        // Agregar el mensaje al historial de mensajes
+                        if (broadcast_count < MAX_BROADCAST_MESSAGES) {
+                            strcpy(broadcast_messages[broadcast_count], formatted_message);
+                            broadcast_count++;
+                        } else {
+                            // Desplazar mensajes antiguos para hacer espacio
+                            for (int i = 1; i < MAX_BROADCAST_MESSAGES; i++) {
+                                strcpy(broadcast_messages[i - 1], broadcast_messages[i]);
+                            }
+                            strcpy(broadcast_messages[MAX_BROADCAST_MESSAGES - 1], formatted_message);
+                        }
+            
+                        // Volver a dibujar la pantalla en modo broadcast
+                        if (in_broadcast_mode) {
+                            redraw_broadcast_screen();
+                        }
+                    }
                 }
-                else {
-                    printf("Error: No se encontró información para el usuario %s\n", target);
-                }
-                awaiting_response = 0;
             }
 
             json_decref(root);
             lws_callback_on_writable(wsi);
-            break;
+            break;          
 
         case LWS_CALLBACK_CLOSED:
             printf("Conexión cerrada\n");
@@ -189,6 +267,9 @@ int main(int argc, char *argv[]) {
         lws_service(context, 0);
     }
 
+    pthread_t receive_thread;
+    pthread_create(&receive_thread, NULL, receive_messages, (void *)context);
+
     // -------------- MENÚ DE OPCIONES ------------------------
     int opcion;
     do {
@@ -206,7 +287,53 @@ int main(int argc, char *argv[]) {
 
         switch (opcion) {
             case 1:
-                printf("Modo broadcast activado.\n");
+                in_broadcast_mode = 1;
+                redraw_broadcast_screen();
+
+                while (1) {
+                    char mensaje_usuario[MAX_MESSAGE_LEN] = {0};
+
+                    char c = getch();
+                    if (c == 27) { // 27 es el código ASCII de ESC
+                        printf("\nSaliendo del modo broadcast...\n");
+                        in_broadcast_mode = 0;
+                        break;
+                    }
+
+                    pthread_mutex_lock(&writing_mutex);
+                    is_writing = 1;
+                    pthread_mutex_unlock(&writing_mutex);
+
+                    // Leer el mensaje después de la primera tecla presionada
+                    ungetc(c, stdin);
+                    fgets(mensaje_usuario, sizeof(mensaje_usuario), stdin);
+                    mensaje_usuario[strcspn(mensaje_usuario, "\n")] = 0; // Eliminar salto de línea
+
+                    // No activar si no escribió nada
+                    if (strlen(mensaje_usuario) == 0) {
+                        pthread_mutex_lock(&writing_mutex);
+                        is_writing = 0;
+                        pthread_mutex_unlock(&writing_mutex);
+                        continue;
+                    }
+
+                    // Crear JSON {"type": "broadcast", "sender": "usuario", "mensaje": "texto"}
+                    char json_mensaje[MAX_MESSAGE_LEN];
+                    snprintf(json_mensaje, sizeof(json_mensaje), 
+                        "{\"type\": \"broadcast\", \"sender\": \"%s\", \"content\": \"%s\"}",
+                        username, mensaje_usuario);
+
+                    // Enviar mensaje al servidor
+                    mensaje_len = strlen(json_mensaje);
+                    memcpy(&buffer[LWS_PRE], json_mensaje, mensaje_len);
+                    lws_write(wsi, &buffer[LWS_PRE], mensaje_len, LWS_WRITE_TEXT);
+
+                    pthread_mutex_lock(&writing_mutex);
+                    is_writing = 0;
+                    pthread_mutex_unlock(&writing_mutex);
+
+                    lws_service(context, 0);
+                }
                 break;
             case 2:
                 printf("Modo mensajes directos activado.\n");
@@ -311,12 +438,12 @@ int main(int argc, char *argv[]) {
             default:
                 printf("Opción inválida. Intente de nuevo.\n");
         }
-    } while (opcion != 1 && opcion != 2);
+    } while (opcion != 7);
 
-    while (1) {
-        lws_service(context, 0);
-    }
+    pthread_cancel(receive_thread);
+    pthread_join(receive_thread, NULL);
 
     lws_context_destroy(context);
+
     return 0;
 }
