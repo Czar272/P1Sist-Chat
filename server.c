@@ -1,4 +1,4 @@
-//gcc server.c -o server -lwebsockets -ljansson
+//gcc server.c -o server -lwebsockets -ljansson -lpthread
 //wscat -c ws://localhost:8000
 //ssh -i /home/czar/ProyectoSistos1/KEY_PAIR_CHAT_SERVER.pem ubuntu@3.144.12.94
 
@@ -8,6 +8,7 @@
 #include <stdio.h>
 #include <jansson.h>
 #include <time.h>
+#include <pthread.h>
 
 #define MAX_USERS 100
 
@@ -20,6 +21,7 @@ typedef struct {
 } User;
 
 static User users[MAX_USERS];
+pthread_mutex_t user_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 void gen_timestamp(char *buffer, size_t buffer_size) {
   time_t now = time(NULL);
@@ -67,6 +69,7 @@ static int callback_chat(struct lws *wsi, enum lws_callback_reasons reason,
         }
 
         if (strcmp(type, "register") == 0) {
+            pthread_mutex_lock(&user_mutex);
             for (int i = 0; i < MAX_USERS; i++) {
                 if (!users[i].active) {
                     strcpy(users[i].username, sender);
@@ -99,6 +102,7 @@ static int callback_chat(struct lws *wsi, enum lws_callback_reasons reason,
                     break;
                 }
             }
+            pthread_mutex_unlock(&user_mutex);
 
         } else if (strcmp(type, "broadcast") == 0 ) {
             const char *content = json_string_value(json_object_get(root, "content"));
@@ -108,32 +112,33 @@ static int callback_chat(struct lws *wsi, enum lws_callback_reasons reason,
             
 
             if (!content) {
-                printf("Mensaje 'broadcast' inválido: falta 'content' o 'timestamp'\n");
+                printf("Mensaje 'broadcast' inválido: falta 'content'\n");
                 break;
             }
             // Reenviar a todos los usuarios activos
+            pthread_mutex_lock(&user_mutex);
             for (int i = 0; i < MAX_USERS; i++) {
-              if (users[i].active && users[i].wsi) {
-                  // Opcional: omitir al emisor
+                if (users[i].active && users[i].wsi) {
 
-                  char response[512];
-                  snprintf(response, sizeof(response),
-                      "{\"type\":\"broadcast\",\"sender\":\"%s\","
-                      "\"content\":\"%s\",\"timestamp\":\"%s\"}",
-                      sender, content, timestamp);
+                    char response[512];
+                    snprintf(response, sizeof(response),
+                        "{\"type\":\"broadcast\",\"sender\":\"%s\","
+                        "\"content\":\"%s\",\"timestamp\":\"%s\"}",
+                        sender, content, timestamp);
 
-                  unsigned char buf[LWS_PRE + 512];
-                  unsigned char *p = &buf[LWS_PRE];
-                  size_t n = strlen(response);
-                  memcpy(p, response, n);
-                  lws_write(users[i].wsi, p, n, LWS_WRITE_TEXT);
-              }
+                    unsigned char buf[LWS_PRE + 512];
+                    unsigned char *p = &buf[LWS_PRE];
+                    size_t n = strlen(response);
+                    memcpy(p, response, n);
+                    lws_write(users[i].wsi, p, n, LWS_WRITE_TEXT);
+                }
             }
-          printf("Broadcast enviado por %s: %s\n", sender, content);
-            
+            pthread_mutex_unlock(&user_mutex);
+            printf("Broadcast enviado por %s: %s\n", sender, content);
+
         } else if (strcmp(type, "private")==0) {
 
-          const char *target = json_string_value(json_object_get(root, "target"));
+            const char *target = json_string_value(json_object_get(root, "target"));
             const char *content = json_string_value(json_object_get(root, "content"));
 
             if (!target || !content) {
@@ -142,6 +147,7 @@ static int callback_chat(struct lws *wsi, enum lws_callback_reasons reason,
             }
 
             // Buscar al usuario destino
+            pthread_mutex_lock(&user_mutex);
             int encontrado = 0;
             for (int i = 0; i < MAX_USERS; i++) {
                 if (users[i].active && strcmp(users[i].username, target) == 0) {
@@ -150,7 +156,7 @@ static int callback_chat(struct lws *wsi, enum lws_callback_reasons reason,
                     gen_timestamp(timestamp, sizeof(timestamp));
 
                     snprintf(response, sizeof(response),
-                        "{\"type\":\"private\",\"sender\":\"%s\",\"target\":\"%s\","
+                        "{\"type\":\"private\",\"sender\":\"%s\",\"target\":\"%s\","  
                         "\"content\":\"%s\",\"timestamp\":\"%s\"}",
                         sender, target, content, timestamp);
 
@@ -165,6 +171,7 @@ static int callback_chat(struct lws *wsi, enum lws_callback_reasons reason,
                     break;
                 }
             }
+            pthread_mutex_unlock(&user_mutex);
 
             if (!encontrado) {
                 printf("Usuario destino '%s' no encontrado o no conectado\n", target);
@@ -177,11 +184,13 @@ static int callback_chat(struct lws *wsi, enum lws_callback_reasons reason,
             // Crear un arreglo JSON
             json_t *user_list = json_array();
 
+            pthread_mutex_lock(&user_mutex);
             for (int i = 0; i < MAX_USERS; i++) {
                 if (users[i].active) {
                     json_array_append_new(user_list, json_string(users[i].username));
                 }
             }
+            pthread_mutex_unlock(&user_mutex);
 
             // Armar la respuesta
             json_t *response = json_object();
@@ -214,157 +223,164 @@ static int callback_chat(struct lws *wsi, enum lws_callback_reasons reason,
 
             int encontrado = 0;
 
+            pthread_mutex_lock(&user_mutex);
             for (int i = 0; i < MAX_USERS; i++) {
                 if (users[i].active && strcmp(users[i].username, target) == 0) {
                     char timestamp[64];
                     gen_timestamp(timestamp, sizeof(timestamp));
-
+        
                     // Construir contenido del mensaje
                     json_t *info = json_object();
                     json_object_set_new(info, "ip", json_string(users[i].ip));
                     json_object_set_new(info, "status", json_string(users[i].status));
-
+        
                     json_t *response = json_object();
                     json_object_set_new(response, "type", json_string("user_info_response"));
                     json_object_set_new(response, "sender", json_string("server"));
                     json_object_set_new(response, "target", json_string(target));
                     json_object_set_new(response, "content", info);
                     json_object_set_new(response, "timestamp", json_string(timestamp));
-
+        
                     // Serializar a string
                     char *response_str = json_dumps(response, JSON_COMPACT);
-
+        
                     unsigned char buf[LWS_PRE + 1024];
                     unsigned char *p = &buf[LWS_PRE];
                     size_t n = strlen(response_str);
                     memcpy(p, response_str, n);
                     lws_write(wsi, p, n, LWS_WRITE_TEXT);
-
+        
                     printf("Info enviada sobre %s\n", target);
-
+        
                     free(response_str);
                     json_decref(response);
-
+        
                     encontrado = 1;
                     break;
                 }
             }
 
+            pthread_mutex_unlock(&user_mutex);
             if (!encontrado) {
                 printf("Usuario '%s' no encontrado\n", target);
-                // O puedes enviar mensaje de error aquí si deseas
+
             }
-
+        
         } else if (strcmp(type, "change_status") == 0) {
-                const char *new_status = json_string_value(json_object_get(root, "content"));
+            const char *new_status = json_string_value(json_object_get(root, "content"));
 
-                if (!new_status) {
-                    printf("Mensaje 'change_status' inválido: falta 'content'\n");
+            if (!new_status) {
+                printf("Mensaje 'change_status' inválido: falta 'content'\n");
+                break;
+            }
+        
+            int actualizado = 0;
+
+            pthread_mutex_lock(&user_mutex);
+            for (int i = 0; i < MAX_USERS; i++) {
+                if (users[i].active && strcmp(users[i].username, sender) == 0) {
+                    strcpy(users[i].status, new_status);
+                    actualizado = 1;
+        
+                    char timestamp[64];
+                    gen_timestamp(timestamp, sizeof(timestamp));
+        
+                    // Contenido del mensaje
+                    json_t *status_obj = json_object();
+                    json_object_set_new(status_obj, "user", json_string(sender));
+                    json_object_set_new(status_obj, "status", json_string(new_status));
+        
+                    // Mensaje completo
+                    json_t *response = json_object();
+                    json_object_set_new(response, "type", json_string("status_update"));
+                    json_object_set_new(response, "sender", json_string("server"));
+                    json_object_set_new(response, "content", status_obj);
+                    json_object_set_new(response, "timestamp", json_string(timestamp));
+        
+                    char *response_str = json_dumps(response, JSON_COMPACT);
+        
+                    // Enviar a todos los usuarios conectados
+                    for (int j = 0; j < MAX_USERS; j++) {
+                        if (users[j].active && users[j].wsi) {
+                            unsigned char buf[LWS_PRE + 1024];
+                            unsigned char *p = &buf[LWS_PRE];
+                            size_t n = strlen(response_str);
+                            memcpy(p, response_str, n);
+                            lws_write(users[j].wsi, p, n, LWS_WRITE_TEXT);
+                        }
+                    }
+        
+                    printf("Estado de %s cambiado a %s\n", sender, new_status);
+        
+                    free(response_str);
+                    json_decref(response);
                     break;
                 }
-
-                int actualizado = 0;
-
-                for (int i = 0; i < MAX_USERS; i++) {
-                    if (users[i].active && strcmp(users[i].username, sender) == 0) {
-                        strcpy(users[i].status, new_status);
-                        actualizado = 1;
-
-                        char timestamp[64];
-                        gen_timestamp(timestamp, sizeof(timestamp));
-
-                        // Contenido del mensaje
-                        json_t *status_obj = json_object();
-                        json_object_set_new(status_obj, "user", json_string(sender));
-                        json_object_set_new(status_obj, "status", json_string(new_status));
-
-                        // Mensaje completo
-                        json_t *response = json_object();
-                        json_object_set_new(response, "type", json_string("status_update"));
-                        json_object_set_new(response, "sender", json_string("server"));
-                        json_object_set_new(response, "content", status_obj);
-                        json_object_set_new(response, "timestamp", json_string(timestamp));
-
-                        char *response_str = json_dumps(response, JSON_COMPACT);
-
-                        // Enviar a todos los usuarios conectados
-                        for (int j = 0; j < MAX_USERS; j++) {
-                            if (users[j].active && users[j].wsi) {
-                                unsigned char buf[LWS_PRE + 1024];
-                                unsigned char *p = &buf[LWS_PRE];
-                                size_t n = strlen(response_str);
-                                memcpy(p, response_str, n);
-                                lws_write(users[j].wsi, p, n, LWS_WRITE_TEXT);
-                            }
-                        }
-
-                        printf("Estado de %s cambiado a %s\n", sender, new_status);
-
-                        free(response_str);
-                        json_decref(response);
-                        break;
-                    }
-                }
-
-                if (!actualizado) {
-                    printf("Usuario %s no encontrado para actualizar estado\n", sender);
-                    // Puedes enviar mensaje de error si lo deseas aquí también
-                }
-            } else if (strcmp(type, "disconnect") == 0) {
-                int encontrado = 0;
-
-                for (int i = 0; i< MAX_USERS; i++) {
-                    if (users[i].active && strcmp(users[i].username, sender) == 0 ){
-                        users[i].active = 0;
-                        users[i].wsi = NULL;
-
-                        char timestamp[64];
-                        gen_timestamp(timestamp, sizeof(timestamp));
-
-                        char message[256];
-                        snprintf(message, sizeof(message), "%s ha salido", sender);
-
-                        // Armar respuesta
-                        json_t *response = json_object();
-                        json_object_set_new(response, "type", json_string("user_disconnected"));
-                        json_object_set_new(response, "sender", json_string("server"));
-                        json_object_set_new(response, "content", json_string(message));
-                        json_object_set_new(response, "timestamp", json_string(timestamp));
-
-                        char *response_str = json_dumps(response, JSON_COMPACT);
-
-                        // Enviar a todos los usuarios conectados
-                        for (int j = 0; j < MAX_USERS; j++) {
-                            if (users[j].active && users[j].wsi) {
-                                unsigned char buf[LWS_PRE + 512];
-                                unsigned char *p = &buf[LWS_PRE];
-                                size_t n = strlen(response_str);
-                                memcpy(p, response_str, n);
-                                lws_write(users[j].wsi, p, n, LWS_WRITE_TEXT);
-                            }
-                        }
-
-                        printf("Usuario %s se desconectó voluntariamente\n", sender);
-
-                        free(response_str);
-                        json_decref(response);
-                        encontrado = 1;
-                        break;
-                    }
-                }
-
-                if (!encontrado) {
-                    printf("Usuario %s no encontrado para desconexión\n", sender);
-                }
-
-                lws_close_reason(wsi, LWS_CLOSE_STATUS_NORMAL, (unsigned char *)"Bye", 3);
-                return -1;
             }
+            pthread_mutex_unlock(&user_mutex);
+        
+            if (!actualizado) {
+                printf("Usuario %s no encontrado para actualizar estado\n", sender);
+
+            }
+        } else if (strcmp(type, "disconnect") == 0) {
+            int encontrado = 0;
+        
+            pthread_mutex_lock(&user_mutex);
+            for (int i = 0; i< MAX_USERS; i++) {
+                if (users[i].active && strcmp(users[i].username, sender) == 0 ){
+                    users[i].active = 0;
+                    users[i].wsi = NULL;
+        
+                    char timestamp[64];
+                    gen_timestamp(timestamp, sizeof(timestamp));
+        
+                    char message[256];
+                    snprintf(message, sizeof(message), "%s ha salido", sender);
+        
+                    // Armar respuesta
+                    json_t *response = json_object();
+                    json_object_set_new(response, "type", json_string("user_disconnected"));
+                    json_object_set_new(response, "sender", json_string("server"));
+                    json_object_set_new(response, "content", json_string(message));
+                    json_object_set_new(response, "timestamp", json_string(timestamp));
+        
+                    char *response_str = json_dumps(response, JSON_COMPACT);
+        
+                    // Enviar a todos los usuarios conectados
+                    for (int j = 0; j < MAX_USERS; j++) {
+                        if (users[j].active && users[j].wsi) {
+                            unsigned char buf[LWS_PRE + 512];
+                            unsigned char *p = &buf[LWS_PRE];
+                            size_t n = strlen(response_str);
+                            memcpy(p, response_str, n);
+                            lws_write(users[j].wsi, p, n, LWS_WRITE_TEXT);
+                        }
+                    }
+        
+                    printf("Usuario %s se desconectó voluntariamente\n", sender);
+        
+                    free(response_str);
+                    json_decref(response);
+                    encontrado = 1;
+                    break;
+                }
+            }
+            pthread_mutex_unlock(&user_mutex);
+        
+            if (!encontrado) {
+                printf("Usuario %s no encontrado para desconexión\n", sender);
+            }
+        
+            lws_close_reason(wsi, LWS_CLOSE_STATUS_NORMAL, (unsigned char *)"Bye", 3);
+            return -1;
+        }
         json_decref(root);
         break;
     }
 
     case LWS_CALLBACK_CLOSED: {
+        pthread_mutex_lock(&user_mutex);
         for (int i = 0; i < MAX_USERS; i++) {
             if (users[i].wsi == wsi) {
                 printf("Usuario %s se desconectó\n", users[i].username);
@@ -372,6 +388,7 @@ static int callback_chat(struct lws *wsi, enum lws_callback_reasons reason,
                 break;
             }
         }
+        pthread_mutex_unlock(&user_mutex);
         break;
     }
 
