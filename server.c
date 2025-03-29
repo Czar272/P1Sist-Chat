@@ -18,6 +18,7 @@ typedef struct {
     char status[16];
     char ip[64];
     int active;
+    time_t last_activity;
 } User;
 
 static User users[MAX_USERS];
@@ -28,6 +29,57 @@ void gen_timestamp(char *buffer, size_t buffer_size) {
   struct tm *t = gmtime(&now);
   strftime(buffer, buffer_size, "%Y-%m-%dT%H:%M:%SZ", t);
 }
+
+void *monitor_inactividad(void *arg) {
+    while (1) {
+        sleep(1);
+        time_t ahora = time(NULL);
+
+        pthread_mutex_lock(&user_mutex);
+        for (int i = 0; i < MAX_USERS; i++) {
+            if (users[i].active && strcmp(users[i].status, "AUSENTE") != 0) {
+                double inactivo = difftime(ahora, users[i].last_activity);
+                if (inactivo >= 10) {
+                    strcpy(users[i].status, "AUSENTE");
+
+                    char timestamp[64];
+                    gen_timestamp(timestamp, sizeof(timestamp));
+
+                    json_t *status_obj = json_object();
+                    json_object_set_new(status_obj, "user", json_string(users[i].username));
+                    json_object_set_new(status_obj, "status", json_string("AUSENTE"));
+
+                    json_t *response = json_object();
+                    json_object_set_new(response, "type", json_string("status_update"));
+                    json_object_set_new(response, "sender", json_string("server"));
+                    json_object_set_new(response, "content", status_obj);
+                    json_object_set_new(response, "timestamp", json_string(timestamp));
+
+                    char *response_str = json_dumps(response, JSON_COMPACT);
+
+                    for (int j = 0; j < MAX_USERS; j++) {
+                        if (users[j].active && users[j].wsi) {
+                            unsigned char buf[LWS_PRE + 1024];
+                            unsigned char *p = &buf[LWS_PRE];
+                            size_t n = strlen(response_str);
+                            memcpy(p, response_str, n);
+                            lws_write(users[j].wsi, p, n, LWS_WRITE_TEXT);
+                        }
+                    }
+
+                    printf("Usuario %s marcado como AUSENTE\n", users[i].username);
+
+                    free(response_str);
+                    json_decref(response);
+                }
+            }
+        }
+        pthread_mutex_unlock(&user_mutex);
+    }
+    return NULL;
+}
+
+
 
 static int callback_chat(struct lws *wsi, enum lws_callback_reasons reason,
                          void *user, void *in, size_t len) {
@@ -58,6 +110,53 @@ static int callback_chat(struct lws *wsi, enum lws_callback_reasons reason,
             break;
         }
 
+        pthread_mutex_lock(&user_mutex);
+        for (int i = 0; i < MAX_USERS; i++) {
+            if (users[i].active && users[i].wsi == wsi) {
+                users[i].last_activity = time(NULL);
+
+                // Si estaba ausente, cambiar a ACTIVO y notificar
+                if (strcmp(users[i].status, "AUSENTE") == 0) {
+                    strcpy(users[i].status, "ACTIVO");
+
+                    char timestamp[64];
+                    gen_timestamp(timestamp, sizeof(timestamp));
+
+                    json_t *status_obj = json_object();
+                    json_object_set_new(status_obj, "user", json_string(users[i].username));
+                    json_object_set_new(status_obj, "status", json_string("ACTIVO"));
+
+                    json_t *response = json_object();
+                    json_object_set_new(response, "type", json_string("status_update"));
+                    json_object_set_new(response, "sender", json_string("server"));
+                    json_object_set_new(response, "content", status_obj);
+                    json_object_set_new(response, "timestamp", json_string(timestamp));
+
+                    char *response_str = json_dumps(response, JSON_COMPACT);
+
+                    for (int j = 0; j < MAX_USERS; j++) {
+                        if (users[j].active && users[j].wsi) {
+                            unsigned char buf[LWS_PRE + 1024];
+                            unsigned char *p = &buf[LWS_PRE];
+                            size_t n = strlen(response_str);
+                            memcpy(p, response_str, n);
+                            lws_write(users[j].wsi, p, n, LWS_WRITE_TEXT);
+                        }
+                    }
+
+                    printf("Usuario %s volvió a ACTIVO\n", users[i].username);
+
+                    free(response_str);
+                    json_decref(response);
+                }
+
+                break;
+            }
+        }
+        pthread_mutex_unlock(&user_mutex);
+
+
+
         // Extraer tipo y usuario emisor
         const char *type = json_string_value(json_object_get(root, "type"));
         const char *sender = json_string_value(json_object_get(root, "sender"));
@@ -82,23 +181,42 @@ static int callback_chat(struct lws *wsi, enum lws_callback_reasons reason,
                                            name, sizeof(name), rip, sizeof(rip));
                     strcpy(users[i].ip, rip);
                     users[i].active = 1;
+                    users[i].last_activity = time(NULL);
 
                     // Crear respuesta JSON simple
-                    char response[512];
                     char timestamp[64];
                     gen_timestamp(timestamp, sizeof(timestamp));
 
-                    snprintf(response, sizeof(response),
-                      "{\"type\":\"register_success\",\"sender\":\"server\","
-                      "\"content\":\"Registro exitoso\",\"userList\":[],"
-                      "\"timestamp\":\"%s\"}", timestamp);
+                    // Crear arreglo de usuarios conectados
+                    json_t *user_list = json_array();
+                    for (int j = 0; j < MAX_USERS; j++) {
+                        if (users[j].active) {
+                            json_array_append_new(user_list, json_string(users[j].username));
+                        }
+                    }
 
+                    // Crear objeto de respuesta
+                    json_t *response = json_object();
+                    json_object_set_new(response, "type", json_string("register_success"));
+                    json_object_set_new(response, "sender", json_string("server"));
+                    json_object_set_new(response, "content", json_string("Registro exitoso"));
+                    json_object_set_new(response, "userList", user_list);
+                    json_object_set_new(response, "timestamp", json_string(timestamp));
 
-                    unsigned char buf[LWS_PRE + 512];
+                    // Serializar a string
+                    char *response_str = json_dumps(response, JSON_COMPACT);
+
+                    // Enviar mensaje
+                    unsigned char buf[LWS_PRE + 1024];
                     unsigned char *p = &buf[LWS_PRE];
-                    size_t n = strlen(response);
-                    memcpy(p, response, n);
+                    size_t n = strlen(response_str);
+                    memcpy(p, response_str, n);
                     lws_write(wsi, p, n, LWS_WRITE_TEXT);
+
+                    // Liberar memoria
+                    free(response_str);
+                    json_decref(response);
+
                     break;
                 }
             }
@@ -438,6 +556,9 @@ int main(int argc, char *argv[]) {
     }
 
     printf("Servidor WebSocket activo\n");
+    pthread_t hilo_inactividad;
+    pthread_create(&hilo_inactividad, NULL, monitor_inactividad, NULL);
+
 
     while (1)
         lws_service(context, 1000);
