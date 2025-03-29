@@ -177,9 +177,17 @@ static int callback_chat(struct lws *wsi, enum lws_callback_reasons reason,
 
                     char rip[64];
                     char name[128];
-                    lws_get_peer_addresses(wsi, lws_get_socket_fd(wsi),
-                                           name, sizeof(name), rip, sizeof(rip));
-                    strcpy(users[i].ip, rip);
+
+                    char client_ip[128];  // Buffer para almacenar la IP
+                    lws_get_peer_simple(wsi, client_ip, sizeof(client_ip));
+
+                    if (client_ip) {
+                        strncpy(users[i].ip, client_ip, sizeof(users[i].ip) - 1);
+                        users[i].ip[sizeof(users[i].ip) - 1] = '\0'; // Asegurar terminación
+                    } else {
+                        strcpy(users[i].ip, "Desconocido");
+                    }
+
                     users[i].active = 1;
                     users[i].last_activity = time(NULL);
 
