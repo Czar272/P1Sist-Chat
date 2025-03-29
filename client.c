@@ -11,12 +11,23 @@
 #include <pthread.h>
 
 #define MAX_MESSAGE_LEN 512
+#define MAX_PRIVATE_MESSAGES 100
 #define MAX_NAME_LEN 50
 #define MAX_BROADCAST_MESSAGES 10
 
+typedef struct {
+    char sender[MAX_MESSAGE_LEN];
+    char content[MAX_MESSAGE_LEN];
+    char target[MAX_MESSAGE_LEN];
+} private_message_t;
+
+private_message_t private_messages[MAX_PRIVATE_MESSAGES];
+int private_message_count = 0;
 char broadcast_messages[MAX_BROADCAST_MESSAGES][MAX_MESSAGE_LEN];
 int broadcast_count = 0;
 int in_broadcast_mode = 0;
+int in_private_chat = 0;
+char current_private_chat[MAX_NAME_LEN] = "";
 
 static struct lws *global_wsi;
 static char username[MAX_NAME_LEN];
@@ -47,6 +58,19 @@ void redraw_broadcast_screen() {
         printf("%s\n", broadcast_messages[i]);
     }
     printf("\nModo broadcast activado. Presiona ESC para volver al menú.\n");
+}
+
+void redraw_private_chat_screen() {
+    system("clear");
+
+    // Mostrar los mensajes privados
+    for (int i = 0; i < private_message_count; i++) {
+        if (strcmp(private_messages[i].sender, current_private_chat) == 0 || (strcmp(private_messages[i].sender, username) == 0 && strcmp(private_messages[i].target, current_private_chat) == 0)) {
+            printf("[Privado] %s: %s\n", private_messages[i].sender, private_messages[i].content);
+        }
+    }
+
+    printf("\nChateando con %s. Presiona ESC para volver al menú.\n", current_private_chat);
 }
 
 // Función para manejar la recepción de mensajes
@@ -103,6 +127,7 @@ static int callback_client(struct lws *wsi, enum lws_callback_reasons reason,
             if (!awaiting_response) {
 
                 if (type && strcmp(type, "broadcast") == 0) {
+
                     const char *sender = json_string_value(json_object_get(root, "sender"));
                     const char *content = json_string_value(json_object_get(root, "content"));
             
@@ -126,6 +151,29 @@ static int callback_client(struct lws *wsi, enum lws_callback_reasons reason,
                         // Volver a dibujar la pantalla en modo broadcast
                         if (in_broadcast_mode) {
                             redraw_broadcast_screen();
+                        }
+                    }
+                }
+                else if (type && strcmp(type, "private") == 0) {
+                    
+                    const char *sender = json_string_value(json_object_get(root, "sender"));
+                    const char *target = json_string_value(json_object_get(root, "target"));
+                    const char *content = json_string_value(json_object_get(root, "content"));
+            
+                    if (sender && target && content) {
+                        // Guardar mensaje en el historial de mensajes privados
+                        if (private_message_count < MAX_PRIVATE_MESSAGES) {
+                            snprintf(private_messages[private_message_count].sender, MAX_MESSAGE_LEN, "%s", sender);
+                            snprintf(private_messages[private_message_count].content, MAX_MESSAGE_LEN, "%s", content);
+                            snprintf(private_messages[private_message_count].target, MAX_MESSAGE_LEN, "%s", target);
+                            private_message_count++;
+                        }
+            
+                        // Mostrar el mensaje solo si estamos en el chat privado con ese usuario
+                        if (in_private_chat && strcmp(current_private_chat, sender) == 0) {
+                            redraw_private_chat_screen();
+                        } else {
+                            printf("\nNuevo mensaje privado de %s: %s\n", sender, content);
                         }
                     }
                 }
@@ -164,33 +212,6 @@ static int callback_client(struct lws *wsi, enum lws_callback_reasons reason,
                         printf("Error: No se encontró información para el usuario %s\n", target);
                     }
                     awaiting_response = 0;
-                }
-                else if (type && strcmp(type, "broadcast") == 0) {
-                    const char *sender = json_string_value(json_object_get(root, "sender"));
-                    const char *content = json_string_value(json_object_get(root, "content"));
-            
-                    if (sender && content) {
-                        // Guardar mensaje en un buffer global para mostrarlo luego
-                        char formatted_message[MAX_MESSAGE_LEN];
-                        snprintf(formatted_message, sizeof(formatted_message), "%s: %s", sender, content);
-            
-                        // Agregar el mensaje al historial de mensajes
-                        if (broadcast_count < MAX_BROADCAST_MESSAGES) {
-                            strcpy(broadcast_messages[broadcast_count], formatted_message);
-                            broadcast_count++;
-                        } else {
-                            // Desplazar mensajes antiguos para hacer espacio
-                            for (int i = 1; i < MAX_BROADCAST_MESSAGES; i++) {
-                                strcpy(broadcast_messages[i - 1], broadcast_messages[i]);
-                            }
-                            strcpy(broadcast_messages[MAX_BROADCAST_MESSAGES - 1], formatted_message);
-                        }
-            
-                        // Volver a dibujar la pantalla en modo broadcast
-                        if (in_broadcast_mode) {
-                            redraw_broadcast_screen();
-                        }
-                    }
                 }
             }
 
@@ -335,9 +356,74 @@ int main(int argc, char *argv[]) {
                     lws_service(context, 0);
                 }
                 break;
+
             case 2:
-                printf("Modo mensajes directos activado.\n");
+                in_private_chat = 1;
+                printf("Ingrese el nombre del usuario con el que desea chatear: ");
+                fgets(current_private_chat, sizeof(current_private_chat), stdin);
+                current_private_chat[strcspn(current_private_chat, "\n")] = 0;
+            
+                // Limpiar mensajes anteriores
+                system("clear");
+                redraw_private_chat_screen();
+
+                while (1) {
+                    char mensaje_usuario[MAX_MESSAGE_LEN] = {0};
+            
+                    char c = getch();
+                    if (c == 27) { // ESC para salir
+                        printf("\nSaliendo del chat privado con %s...\n", current_private_chat);
+                        in_private_chat = 0;
+                        break;
+                    }
+            
+                    // Si la primera tecla no es ESC, activar is_writing
+                    pthread_mutex_lock(&writing_mutex);
+                    is_writing = 1;
+                    pthread_mutex_unlock(&writing_mutex);
+            
+                    // Leer el mensaje después de la primera tecla presionada
+                    ungetc(c, stdin);
+                    fgets(mensaje_usuario, sizeof(mensaje_usuario), stdin);
+                    mensaje_usuario[strcspn(mensaje_usuario, "\n")] = 0;
+            
+                    if (strlen(mensaje_usuario) == 0) { 
+                        pthread_mutex_lock(&writing_mutex);
+                        is_writing = 0; // No activar si no escribió nada
+                        pthread_mutex_unlock(&writing_mutex);
+                        continue;
+                    }
+            
+                    // Crear JSON {"type": "private", "sender": "usuario", "target": "destino", "content": "mensaje"}
+                    char json_mensaje[MAX_MESSAGE_LEN];
+                    snprintf(json_mensaje, sizeof(json_mensaje), 
+                        "{\"type\": \"private\", \"sender\": \"%s\", \"target\": \"%s\", \"content\": \"%s\"}",
+                        username, current_private_chat, mensaje_usuario);
+            
+                    // Enviar mensaje al servidor
+                    mensaje_len = strlen(json_mensaje);
+                    memcpy(&buffer[LWS_PRE], json_mensaje, mensaje_len);
+
+                    if (private_message_count < MAX_PRIVATE_MESSAGES) {
+                        snprintf(private_messages[private_message_count].sender, MAX_MESSAGE_LEN, "%s", username);
+                        snprintf(private_messages[private_message_count].content, MAX_MESSAGE_LEN, "%s", mensaje_usuario);
+                        snprintf(private_messages[private_message_count].target, MAX_MESSAGE_LEN, "%s", current_private_chat);
+                        private_message_count++;
+                    }
+                    
+                    // Refrescar la pantalla para que el remitente vea su propio mensaje
+                    redraw_private_chat_screen();
+
+                    lws_write(wsi, &buffer[LWS_PRE], mensaje_len, LWS_WRITE_TEXT);
+                    lws_service(context, 0);
+            
+                    // Desactivar is_writing después de enviar el mensaje
+                    pthread_mutex_lock(&writing_mutex);
+                    is_writing = 0;
+                    pthread_mutex_unlock(&writing_mutex);
+                }
                 break;
+
             case 3:
                 printf("\nSeleccione un nuevo estado:\n");
                 printf("1. ACTIVO\n");
@@ -379,6 +465,7 @@ int main(int argc, char *argv[]) {
                 
                 printf("Estado cambiado a: %s\n", nuevo_estado);                
                 break;
+
             case 4:
                 // Crear mensaje JSON para solicitar la lista de usuarios
                 char json_list_request[MAX_MESSAGE_LEN];
@@ -400,19 +487,20 @@ int main(int argc, char *argv[]) {
                 }
 
                 break;
+
             case 5:
                 printf("Ingrese el nombre del usuario: ");
-                char target_user[MAX_NAME_LEN];
-                fgets(target_user, sizeof(target_user), stdin);
-                target_user[strcspn(target_user, "\n")] = 0;  // Eliminar salto de línea
+                char target_user_info[MAX_NAME_LEN];
+                fgets(target_user_info, sizeof(target_user_info), stdin);
+                target_user_info[strcspn(target_user_info, "\n")] = 0;  // Eliminar salto de línea
             
-                printf("Solicitando información sobre el usuario %s...\n", target_user);
+                printf("Solicitando información sobre el usuario %s...\n", target_user_info);
             
                 // Crear mensaje JSON para solicitar la información del usuario
                 char json_user_info_request[MAX_MESSAGE_LEN];
                 snprintf(json_user_info_request, sizeof(json_user_info_request),
                         "{\"type\": \"user_info\", \"sender\": \"%s\", \"target\": \"%s\"}",
-                        username, target_user);
+                        username, target_user_info);
             
                 // Enviar la solicitud al servidor
                 mensaje_len = strlen(json_user_info_request);
@@ -428,13 +516,16 @@ int main(int argc, char *argv[]) {
                     usleep(100000);
                 }
                 break;
+
             case 6:
                 printf("Ayuda: Elija una opción y siga las instrucciones.\n");
                 break;
+
             case 7:
                 printf("Saliendo del chat...\n");
                 lws_context_destroy(context);
                 return 0;
+
             default:
                 printf("Opción inválida. Intente de nuevo.\n");
         }
