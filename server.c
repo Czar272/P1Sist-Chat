@@ -1,7 +1,3 @@
-//gcc server.c -o server -lwebsockets -ljansson -lpthread
-//wscat -c ws://localhost:8000
-//ssh -i /home/czar/ProyectoSistos1/KEY_PAIR_CHAT_SERVER.pem ubuntu@3.144.12.94
-
 #include <libwebsockets.h>
 #include <string.h>
 #include <stdlib.h>
@@ -84,21 +80,39 @@ static int callback_chat(struct lws *wsi, enum lws_callback_reasons reason,
                     users[i].active = 1;
 
                     // Crear respuesta JSON simple
-                    char response[512];
                     char timestamp[64];
                     gen_timestamp(timestamp, sizeof(timestamp));
 
-                    snprintf(response, sizeof(response),
-                      "{\"type\":\"register_success\",\"sender\":\"server\","
-                      "\"content\":\"Registro exitoso\",\"userList\":[],"
-                      "\"timestamp\":\"%s\"}", timestamp);
+                    // Crear arreglo de usuarios conectados
+                    json_t *user_list = json_array();
+                    for (int j = 0; j < MAX_USERS; j++) {
+                        if (users[j].active) {
+                            json_array_append_new(user_list, json_string(users[j].username));
+                        }
+                    }
 
+                    // Crear objeto de respuesta
+                    json_t *response = json_object();
+                    json_object_set_new(response, "type", json_string("register_success"));
+                    json_object_set_new(response, "sender", json_string("server"));
+                    json_object_set_new(response, "content", json_string("Registro exitoso"));
+                    json_object_set_new(response, "userList", user_list);
+                    json_object_set_new(response, "timestamp", json_string(timestamp));
 
-                    unsigned char buf[LWS_PRE + 512];
+                    // Serializar a string
+                    char *response_str = json_dumps(response, JSON_COMPACT);
+
+                    // Enviar mensaje
+                    unsigned char buf[LWS_PRE + 1024];
                     unsigned char *p = &buf[LWS_PRE];
-                    size_t n = strlen(response);
-                    memcpy(p, response, n);
+                    size_t n = strlen(response_str);
+                    memcpy(p, response_str, n);
                     lws_write(wsi, p, n, LWS_WRITE_TEXT);
+
+                    // Liberar memoria
+                    free(response_str);
+                    json_decref(response);
+
                     break;
                 }
             }
