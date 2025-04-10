@@ -2,6 +2,7 @@
   "files.associations": {
     "stdio.h": "c",
     "string.h": "c",
-    "libwebsockets.h": "c"
+    "libwebsockets.h": "c",
+    "time.h": "c"
   }
 }
